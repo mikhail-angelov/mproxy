@@ -1,0 +1,12 @@
+services:
+  mproxy:
+    image: ghcr.io/mikhail-angelov/mproxy:latest
+    ports:
+      - "8080:8080"   # plain HTTP
+      - "8443:8443"   # HTTPS (TLS)
+    env_file:
+      - .env
+    volumes:
+      - ./certs:/certs:ro
+    restart: unless-stopped
+    stop_grace_period: 15s

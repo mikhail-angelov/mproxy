@@ -1,0 +1,237 @@
+package proxy
+
+import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/assert"
+)
+
+func testConfig() *Config {
+	return &Config{
+		port:                0,
+		user:                "test",
+		password:            "test",
+		invalidAuthAttempts: 2,
+	}
+}
+
+func authHeader(user string, pass string) string {
+	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
+}
+
+func TestCheckAuth_Table(t *testing.T) {
+	tests := []struct {
+		name       string
+		authHeader string
+		wantOK     bool
+	}{
+		{"valid credentials", authHeader("test", "test"), true},
+		{"no header at all", "", false},
+		{"wrong scheme (Bearer)", "Bearer sometoken", false},
+		{"invalid base64 payload", "Basic !!!not-base64!!!", false},
+		{"missing colon in payload", "Basic " + base64.StdEncoding.EncodeToString([]byte("nouser")), false},
+		{"wrong password", authHeader("test", "wrongpass"), false},
+		{"wrong username", authHeader("nottest", "test"), false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			p := NewProxy(testConfig())
+
+			req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+			req.RemoteAddr = "203.0.113.1:12345"
+			if tt.authHeader != "" {
+				req.Header.Set("Proxy-Authorization", tt.authHeader)
+			}
+
+			result := p.checkAuth(req)
+			assert.Equal(t, tt.wantOK, result)
+		})
+	}
+}
+
+func TestCheckAuth_BlockAfterThreshold(t *testing.T) {
+	cfg := testConfig()
+	p := NewProxy(cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "203.0.113.1:12345"
+	result := p.checkAuth(req)
+	assert.False(t, result)
+
+	req.RemoteAddr = "203.0.113.1:12346"
+	result = p.checkAuth(req)
+	assert.False(t, result)
+
+	req.RemoteAddr = "203.0.113.1:12347"
+	req.Header.Set("Proxy-Authorization", authHeader("test", "test"))
+	result = p.checkAuth(req)
+	assert.False(t, result) //valid auth is failed anyway
+
+	actual, _ := cfg.blockedIp.LoadOrStore("203.0.113.1", new(bool))
+	exist := actual.(bool)
+	assert.True(t, exist)
+}
+
+// ---------- handleHTTPForwarding: интеграционный тест с фейковым upstream ----------
+
+func TestHandleProxy_HTTPForwarding(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Proxy-Authorization") != "" {
+			t.Error("Proxy-Authorization не должен долетать до upstream-сервера")
+		}
+		w.Header().Set("X-Upstream", "yes")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte("hello from upstream"))
+	}))
+	defer upstream.Close()
+
+	p := NewProxy(testConfig())
+
+	req := httptest.NewRequest(http.MethodGet, upstream.URL+"/foo", nil)
+	req.RemoteAddr = "203.0.113.20:4444"
+	req.Header.Set("Proxy-Authorization", authHeader("test", "test"))
+
+	rr := httptest.NewRecorder()
+	p.handleProxy(rr, req)
+
+	if rr.Code != http.StatusTeapot {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusTeapot)
+	}
+	if rr.Header().Get("X-Upstream") != "yes" {
+		t.Fatal("заголовок от upstream не долетел до клиента")
+	}
+	if body := rr.Body.String(); body != "hello from upstream" {
+		t.Fatalf("body = %q", body)
+	}
+}
+
+func TestHandleProxy_UnauthorizedReturns407(t *testing.T) {
+	p := NewProxy(testConfig())
+	req := httptest.NewRequest(http.MethodGet, "http://example.com/", nil)
+	req.RemoteAddr = "203.0.113.30:1111"
+
+	rr := httptest.NewRecorder()
+	p.handleProxy(rr, req)
+
+	if rr.Code != http.StatusProxyAuthRequired {
+		t.Fatalf("status = %d, want %d", rr.Code, http.StatusProxyAuthRequired)
+	}
+	if rr.Header().Get("Proxy-Authenticate") == "" {
+		t.Error("ожидался заголовок Proxy-Authenticate в ответе")
+	}
+}
+
+// ---------- handleConnectTunnel: end-to-end тест через настоящий TCP ----------
+
+func TestHandleProxy_ConnectTunnel(t *testing.T) {
+	// "сайт назначения": простой TCP echo-сервер
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+
+	go func() {
+		conn, err := echoLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn) // эхо всего, что получили
+	}()
+
+	p := NewProxy(testConfig())
+	proxyServer := httptest.NewServer(http.HandlerFunc(p.handleProxy))
+	defer proxyServer.Close()
+
+	proxyAddr := strings.TrimPrefix(proxyServer.URL, "http://")
+
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	connectReq := fmt.Sprintf(
+		"CONNECT %s HTTP/1.1\r\nHost: %s\r\nProxy-Authorization: %s\r\n\r\n",
+		echoLn.Addr().String(), echoLn.Addr().String(), authHeader("test", "test"),
+	)
+	if _, err := conn.Write([]byte(connectReq)); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := bufio.NewReader(conn)
+
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(statusLine, "200") {
+		t.Fatalf("unexpected status line: %q", statusLine)
+	}
+
+	// вычитываем заголовки туннеля до пустой строки
+	for {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			t.Fatal(err)
+		}
+		if line == "\r\n" {
+			break
+		}
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+
+	msg := "ping-through-tunnel\n"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatal(err)
+	}
+
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(reader, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != msg {
+		t.Fatalf("echo mismatch: got %q, want %q", buf, msg)
+	}
+}
+
+func TestHandleProxy_ConnectTunnel_Unauthorized(t *testing.T) {
+	p := NewProxy(testConfig())
+	proxyServer := httptest.NewServer(http.HandlerFunc(p.handleProxy))
+	defer proxyServer.Close()
+
+	proxyAddr := strings.TrimPrefix(proxyServer.URL, "http://")
+	conn, err := net.Dial("tcp", proxyAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// без Proxy-Authorization
+	req := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
+	if _, err := conn.Write([]byte(req)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(statusLine, "407") {
+		t.Fatalf("unexpected status line: %q, want 407", statusLine)
+	}
+}
