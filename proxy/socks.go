@@ -100,9 +100,10 @@ func (s *socksServer) handleConn(conn net.Conn) {
 	}
 	defer target.Close()
 
-	// 4. Send success response with local binding address
-	localAddr := target.LocalAddr().(*net.TCPAddr)
-	if err := s.reply(conn, socksRepSuccess, localAddr); err != nil {
+	// 4. A CONNECT response may use an unspecified bind address. Returning one
+	// avoids relying on the target socket's local address, which is not useful
+	// to clients and can stall tunnel setup on some container networks.
+	if err := s.reply(conn, socksRepSuccess, nil); err != nil {
 		slog.Warn("socks5 reply failed", "ip", clientIP, "target", targetAddr, "error", err)
 		return
 	}
