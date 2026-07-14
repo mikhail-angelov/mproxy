@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,8 +12,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/txthinking/socks5"
 )
 
 type Proxy struct {
@@ -40,9 +37,6 @@ func NewProxy(cfg *Config) *Proxy {
 }
 
 func (p *Proxy) handler() http.Handler {
-	// CONNECT uses an authority-form request target (host:port), which does not
-	// match ServeMux's slash-prefixed path patterns. Use the proxy handler
-	// directly so both regular requests and CONNECT tunnels reach it.
 	return http.HandlerFunc(p.handleProxy)
 }
 
@@ -73,9 +67,6 @@ func (p *Proxy) Run(ctx context.Context) error {
 		slog.Warn("SOCKS5 disabled: set PROXY_SOCKS_PORT to enable it")
 	}
 
-	// runCtx отменяется либо когда отменяется родительский ctx (сигнал остановки),
-	// либо когда один из серверов падает с реальной ошибкой запуска — тогда
-	// нужно аккуратно погасить и второй сервер, а не оставлять его висеть.
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -149,49 +140,13 @@ func (p *Proxy) Run(ctx context.Context) error {
 	wg.Wait()
 
 	return firstErr
-}
 
-type socksServer struct {
-	server   *socks5.Server
-	initErr  error
-	stopping atomic.Bool
-}
-
-func newSocksServer(cfg *Config) *socksServer {
-	server, err := socks5.NewClassicServer(
-		fmt.Sprintf("0.0.0.0:%d", cfg.socksPort),
-		"0.0.0.0",
-		cfg.user,
-		cfg.password,
-		30,
-		0,
-	)
-	return &socksServer{server: server, initErr: err}
-}
-
-func (s *socksServer) Run() error {
-	if s.initErr != nil {
-		return fmt.Errorf("create socks5 server: %w", s.initErr)
-	}
-	err := s.server.ListenAndServe(nil)
-	if s.stopping.Load() && errors.Is(err, net.ErrClosed) {
-		return nil
-	}
-	return err
-}
-
-func (s *socksServer) Shutdown() error {
-	if s.server == nil {
-		return nil
-	}
-	s.stopping.Store(true)
-	return s.server.Shutdown()
 }
 
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		return r.RemoteAddr // на всякий случай, если формат неожиданный
+		return r.RemoteAddr
 	}
 	return host
 }
@@ -204,11 +159,11 @@ func (p *Proxy) checkAuth(r *http.Request) (result bool) {
 
 	defer func() {
 		if result {
-			p.notAuthIp.Delete(ip) // успех — сбрасываем историю неудач
+			p.notAuthIp.Delete(ip)
 			return
 		}
 		actual, _ := p.notAuthIp.LoadOrStore(ip, new(int32))
-		counter := actual.(*int32) // is always pointer to int32
+		counter := actual.(*int32)
 		newCount := atomic.AddInt32(counter, 1)
 
 		if newCount >= int32(p.cfg.invalidAuthAttempts) {
@@ -222,7 +177,6 @@ func (p *Proxy) checkAuth(r *http.Request) (result bool) {
 		return false
 	}
 
-	// Expecting: "Basic <base64-encoded-credentials>"
 	parts := strings.SplitN(authHeader, " ", 2)
 	if len(parts) != 2 || !strings.EqualFold(parts[0], "Basic") {
 		return false
@@ -242,7 +196,6 @@ func (p *Proxy) checkAuth(r *http.Request) (result bool) {
 }
 
 func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
-	// 1. Check if the client is requesting a tunnel
 	slog.Info("Tunneling request", "to", r.Host, "method", r.Method, "auth", r.Header.Get("Proxy-Authorization") != "")
 
 	if !p.checkAuth(r) {
@@ -255,9 +208,9 @@ func (p *Proxy) handleProxy(w http.ResponseWriter, r *http.Request) {
 		p.handleConnectTunnel(w, r)
 	} else {
 		p.handleHTTPForwarding(w, r)
-
 	}
 }
+
 func (p *Proxy) handleConnectTunnel(w http.ResponseWriter, r *http.Request) {
 	destConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
 	if err != nil {
@@ -266,7 +219,6 @@ func (p *Proxy) handleConnectTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer destConn.Close()
 
-	// 3. Hijack the HTTP connection to control the raw TCP client socket
 	hijacker, ok := w.(http.Hijacker)
 	if !ok {
 		http.Error(w, "Webserver does not support hijacking", http.StatusInternalServerError)
@@ -280,10 +232,8 @@ func (p *Proxy) handleConnectTunnel(w http.ResponseWriter, r *http.Request) {
 	}
 	defer clientConn.Close()
 
-	// 4. Notify the client that the secure tunnel has been established
 	_, _ = clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
 
-	// 5. Concurrently tunnel raw data bidirectionally
 	errChan := make(chan error, 2)
 	go func() {
 		_, err := io.Copy(destConn, clientConn)
@@ -294,17 +244,13 @@ func (p *Proxy) handleConnectTunnel(w http.ResponseWriter, r *http.Request) {
 		errChan <- err
 	}()
 
-	// Wait for one side to close or error out
 	<-errChan
 }
 
-// Handle Standard HTTP Forwarding (GET, POST, etc.)
 func (p *Proxy) handleHTTPForwarding(w http.ResponseWriter, r *http.Request) {
-	// Create a shallow copy of the request to send to the destination server
 	reqCopy := r.Clone(r.Context())
 
-	// Clean up hop-by-hop headers meant specifically for this proxy
-	reqCopy.RequestURI = "" // mandatory для RoundTrip
+	reqCopy.RequestURI = ""
 	for _, h := range hopByHopHeaders {
 		reqCopy.Header.Del(h)
 	}
@@ -327,7 +273,6 @@ func (p *Proxy) handleHTTPForwarding(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Copy headers back to the original client response
 	for key, values := range resp.Header {
 		for _, value := range values {
 			w.Header().Add(key, value)

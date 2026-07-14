@@ -3,8 +3,10 @@ package proxy
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"os"
 	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -21,9 +23,15 @@ type Config struct {
 	blockedIpFile       string
 	blockedIp           sync.Map
 	mu                  sync.Mutex
+	socksWhitelist      []string // IPs or CIDRs that skip SOCKS5 auth
 }
 
 func NewConfig() (*Config, error) {
+	socksWhitelist, err := parseWhitelist(os.Getenv("PROXY_SOCKS_WHITELIST"))
+	if err != nil {
+		return nil, fmt.Errorf("parse PROXY_SOCKS_WHITELIST: %w", err)
+	}
+
 	cfg := &Config{
 		port:                getEnvInt("PROXY_PORT", 8080),
 		httpsPort:           getEnvInt("PROXY_HTTPS_PORT", 0),
@@ -35,6 +43,7 @@ func NewConfig() (*Config, error) {
 		rateLimit:           getEnvInt("PROXY_RATE_LIMIT", 100),
 		invalidAuthAttempts: getEnvInt("PROXY_INVALID_AUTH_ATTEMPTS", 20),
 		blockedIpFile:       getEnvStr("PROXY_BLOCKED_IP_FILE", "blocked_ips.json"),
+		socksWhitelist:      socksWhitelist,
 	}
 
 	if cfg.user == "" || cfg.password == "" {
@@ -50,6 +59,29 @@ func NewConfig() (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+func parseWhitelist(raw string) ([]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	parts := strings.Split(raw, ",")
+	result := make([]string, 0, len(parts))
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if net.ParseIP(p) != nil {
+			result = append(result, p)
+			continue
+		}
+		if _, _, err := net.ParseCIDR(p); err != nil {
+			return nil, fmt.Errorf("invalid IP or CIDR %q", p)
+		}
+		result = append(result, p)
+	}
+	return result, nil
 }
 
 func getEnvStr(key, def string) string {

@@ -32,6 +32,15 @@ func authHeader(user string, pass string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
+func TestParseWhitelist(t *testing.T) {
+	whitelist, err := parseWhitelist(" 127.0.0.1, 10.0.0.0/8, ::1 ")
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"127.0.0.1", "10.0.0.0/8", "::1"}, whitelist)
+
+	_, err = parseWhitelist("127.0.0.1,not-an-ip")
+	assert.Error(t, err)
+}
+
 func startSocksServer(t *testing.T, cfg *Config) string {
 	t.Helper()
 
@@ -73,6 +82,12 @@ func startSocksServer(t *testing.T, cfg *Config) string {
 	})
 
 	return addr
+}
+
+func TestSocksShutdownBeforeRun(t *testing.T) {
+	s := newSocksServer(&Config{socksPort: 0})
+	assert.NoError(t, s.Shutdown())
+	assert.NoError(t, s.Run())
 }
 
 func TestCheckAuth_Table(t *testing.T) {
@@ -224,6 +239,186 @@ func TestSocks5AuthAndConnect(t *testing.T) {
 	if string(buf) != msg {
 		t.Fatalf("echo mismatch: got %q, want %q", buf, msg)
 	}
+}
+
+func TestSocks5WhitelistNoAuth(t *testing.T) {
+	cfg := &Config{
+		port:                0,
+		user:                "testuser",
+		password:            "testpass",
+		invalidAuthAttempts: 10,
+		blockedIpFile:       "",
+		socksPort:           0,
+		socksWhitelist:      []string{"127.0.0.1"},
+	}
+	s := newSocksServer(cfg)
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+
+	go func() {
+		conn, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleConn(conn)
+	}()
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Offer only "no auth" method
+	_, err = conn.Write([]byte{5, 1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 5 || resp[1] != 0 {
+		t.Fatalf("expected no-auth, got %v", resp)
+	}
+
+	// Send CONNECT to verify we actually connected, not just skipped auth
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+	go func() {
+		c, err := echoLn.Accept()
+		if err != nil {
+			return
+		}
+		defer c.Close()
+		_, _ = io.Copy(c, c)
+	}()
+
+	echoAddr := echoLn.Addr().String()
+	host, portStr, _ := net.SplitHostPort(echoAddr)
+	var port int
+	fmt.Sscanf(portStr, "%d", &port)
+	ip := net.ParseIP(host).To4()
+
+	connectReq := []byte{5, 1, 0, 1}
+	connectReq = append(connectReq, ip...)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(port))
+	connectReq = append(connectReq, portBytes...)
+	conn.Write(connectReq)
+
+	respHeader := make([]byte, 4)
+	io.ReadFull(conn, respHeader)
+	if respHeader[1] != 0 {
+		t.Fatalf("connect failed: rep=%d", respHeader[1])
+	}
+	// skip bind addr
+	switch respHeader[3] {
+	case 1:
+		io.ReadFull(conn, make([]byte, 6))
+	case 4:
+		io.ReadFull(conn, make([]byte, 18))
+	}
+
+	msg := "whitelist-test-ok\n"
+	conn.Write([]byte(msg))
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(msg))
+	io.ReadFull(conn, buf)
+	assert.Equal(t, msg, string(buf))
+}
+
+func TestSocks5WhitelistCidr(t *testing.T) {
+	cfg := &Config{
+		port:                0,
+		user:                "testuser",
+		password:            "testpass",
+		invalidAuthAttempts: 10,
+		blockedIpFile:       "",
+		socksPort:           0,
+		socksWhitelist:      []string{"127.0.0.0/8"},
+	}
+	s := newSocksServer(cfg)
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+
+	go func() {
+		conn, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleConn(conn)
+	}()
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	_, err = conn.Write([]byte{5, 1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+	assert.Equal(t, byte(0), resp[1]) // no-auth should be accepted via CIDR match
+}
+
+func TestSocks5NotWhitelistedRequiresAuth(t *testing.T) {
+	cfg := &Config{
+		port:                0,
+		user:                "testuser",
+		password:            "testpass",
+		invalidAuthAttempts: 10,
+		blockedIpFile:       "",
+		socksPort:           0,
+		socksWhitelist:      []string{"10.0.0.1", "192.168.0.0/16"},
+	}
+	s := newSocksServer(cfg)
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+
+	go func() {
+		conn, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleConn(conn)
+	}()
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Offer only "no auth" — should be rejected since 127.0.0.1 is not whitelisted
+	_, err = conn.Write([]byte{5, 1, 0})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+	assert.Equal(t, byte(0xFF), resp[1]) // 0xFF = no acceptable methods
 }
 
 func TestSocks5AuthFailure(t *testing.T) {
