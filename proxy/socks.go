@@ -56,6 +56,9 @@ func (s *socksServer) Run() error {
 func (s *socksServer) handleConn(conn net.Conn) {
 	defer conn.Close()
 
+	if tcpConn, ok := conn.(*net.TCPConn); ok {
+		_ = tcpConn.SetNoDelay(true)
+	}
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
 	clientIP := conn.RemoteAddr().(*net.TCPAddr).IP.String()
@@ -267,8 +270,14 @@ func (s *socksServer) reply(conn net.Conn, rep byte, bindAddr *net.TCPAddr) erro
 		resp = append(resp, portBytes...)
 	}
 
-	_, err := conn.Write(resp)
-	return err
+	n, err := conn.Write(resp)
+	if err != nil {
+		return err
+	}
+	if n != len(resp) {
+		return io.ErrShortWrite
+	}
+	return nil
 }
 
 func (s *socksServer) notifyFailedAuth(ip string) {
