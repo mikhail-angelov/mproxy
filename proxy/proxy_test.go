@@ -3,6 +3,7 @@ package proxy
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -23,6 +24,7 @@ func testConfig() *Config {
 		password:            "test",
 		invalidAuthAttempts: 2,
 		blockedIpFile:       "",
+		socksPort:           0,
 	}
 }
 
@@ -59,6 +61,195 @@ func TestCheckAuth_Table(t *testing.T) {
 			assert.Equal(t, tt.wantOK, result)
 		})
 	}
+}
+
+func TestSocks5AuthAndConnect(t *testing.T) {
+	cfg := &Config{
+		port:                0,
+		user:                "testuser",
+		password:            "testpass",
+		invalidAuthAttempts: 10,
+		blockedIpFile:       "",
+		socksPort:           0,
+	}
+	s := newSocksServer(cfg)
+
+	// Start a local TCP echo server as the "target"
+	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer echoLn.Close()
+
+	go func() {
+		conn, err := echoLn.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_, _ = io.Copy(conn, conn)
+	}()
+
+	// Start a local SOCKS5 listener
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+
+	go func() {
+		conn, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleConn(conn)
+	}()
+
+	// Connect to SOCKS5 server
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Auth negotiation: version 5, 2 methods (none, userpass)
+	_, err = conn.Write([]byte{5, 2, 0, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Read auth method selection
+	resp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 5 || resp[1] != 2 {
+		t.Fatalf("expected userpass auth, got %v", resp)
+	}
+
+	// Send username/password sub-negotiation
+	// subver(1) ulen(1) uname ulen plen(1) passwd plen
+	authMsg := []byte{1, 8}
+	authMsg = append(authMsg, []byte("testuser")...)
+	authMsg = append(authMsg, 8)
+	authMsg = append(authMsg, []byte("testpass")...)
+	if _, err := conn.Write(authMsg); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read auth response
+	authResp := make([]byte, 2)
+	if _, err := io.ReadFull(conn, authResp); err != nil {
+		t.Fatal(err)
+	}
+	if authResp[0] != 1 || authResp[1] != 0 {
+		t.Fatalf("auth failed: %v", authResp)
+	}
+
+	// Send CONNECT request to echo server
+	echoAddr := echoLn.Addr().String()
+	echoHost, echoPortStr, _ := net.SplitHostPort(echoAddr)
+	echoPort := 0
+	fmt.Sscanf(echoPortStr, "%d", &echoPort)
+	ip := net.ParseIP(echoHost).To4()
+
+	connectReq := []byte{5, 1, 0, 1}
+	connectReq = append(connectReq, ip...)
+	portBytes := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBytes, uint16(echoPort))
+	connectReq = append(connectReq, portBytes...)
+
+	if _, err := conn.Write(connectReq); err != nil {
+		t.Fatal(err)
+	}
+
+	// Read SOCKS5 response
+	// ver(1) rep(1) rsv(1) atyp(1) bnd.addr(4/16) bnd.port(2)
+	respHeader := make([]byte, 4)
+	if _, err := io.ReadFull(conn, respHeader); err != nil {
+		t.Fatal(err)
+	}
+	if respHeader[0] != 5 || respHeader[1] != 0 {
+		t.Fatalf("connect failed: ver=%d rep=%d", respHeader[0], respHeader[1])
+	}
+
+	// Read the bind address (skip it)
+	atyp := respHeader[3]
+	switch atyp {
+	case 1:
+		buf := make([]byte, 6)
+		io.ReadFull(conn, buf)
+	case 4:
+		buf := make([]byte, 18)
+		io.ReadFull(conn, buf)
+	}
+
+	// Send data through the tunnel
+	msg := "socks5-echo-test\n"
+	if _, err := conn.Write([]byte(msg)); err != nil {
+		t.Fatal(err)
+	}
+
+	_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(conn, buf); err != nil {
+		t.Fatal(err)
+	}
+	if string(buf) != msg {
+		t.Fatalf("echo mismatch: got %q, want %q", buf, msg)
+	}
+}
+
+func TestSocks5AuthFailure(t *testing.T) {
+	cfg := &Config{
+		port:                0,
+		user:                "testuser",
+		password:            "testpass",
+		invalidAuthAttempts: 10,
+		blockedIpFile:       "",
+		socksPort:           0,
+	}
+	s := newSocksServer(cfg)
+
+	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer socksLn.Close()
+
+	go func() {
+		conn, err := socksLn.Accept()
+		if err != nil {
+			return
+		}
+		s.handleConn(conn)
+	}()
+
+	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	// Auth negotiation: version 5, 2 methods (none, userpass)
+	_, err = conn.Write([]byte{5, 2, 0, 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp := make([]byte, 2)
+	io.ReadFull(conn, resp)
+
+	// Send wrong password
+	authMsg := []byte{1, 8}
+	authMsg = append(authMsg, []byte("testuser")...)
+	authMsg = append(authMsg, 9)
+	authMsg = append(authMsg, []byte("wrongpass")...)
+	conn.Write(authMsg)
+
+	authResp := make([]byte, 2)
+	io.ReadFull(conn, authResp)
+	assert.Equal(t, byte(1), authResp[1]) // rep=1 means auth failure
 }
 
 func TestBlockedIpPersistence(t *testing.T) {

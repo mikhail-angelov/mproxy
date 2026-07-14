@@ -24,7 +24,7 @@ COPY --from=builder /mproxy .
 
 USER appuser
 
-# 8080 — plain HTTP, 8443 — HTTPS (если PROXY_HTTPS_PORT задан)
-EXPOSE 8080 8443
+# 8080 — plain HTTP, 8443 — HTTPS (если PROXY_HTTPS_PORT задан), 1080 — SOCKS5
+EXPOSE 8080 8443 1080
 
 ENTRYPOINT ["/app/mproxy"]

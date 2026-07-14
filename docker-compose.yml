@@ -4,6 +4,7 @@ services:
     ports:
       - "8080:8080"   # plain HTTP
       - "8443:8443"   # HTTPS (TLS)
+      - "1080:1080"   # SOCKS5
     env_file:
       - .env
     volumes:

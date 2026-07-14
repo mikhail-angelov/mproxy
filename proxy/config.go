@@ -11,6 +11,7 @@ import (
 type Config struct {
 	port                int
 	httpsPort           int // 0 = HTTPS-disconnected
+	socksPort           int // 0 = SOCKS5-disabled
 	tlsCertFile         string
 	tlsKeyFile          string
 	user                string
@@ -26,6 +27,7 @@ func NewConfig() (*Config, error) {
 	cfg := &Config{
 		port:                getEnvInt("PROXY_PORT", 8080),
 		httpsPort:           getEnvInt("PROXY_HTTPS_PORT", 0),
+		socksPort:           getEnvInt("PROXY_SOCKS_PORT", 0),
 		tlsCertFile:         os.Getenv("PROXY_TLS_CERT_FILE"),
 		tlsKeyFile:          os.Getenv("PROXY_TLS_KEY_FILE"),
 		user:                os.Getenv("PROXY_USER"),

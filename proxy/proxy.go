@@ -18,6 +18,7 @@ type Proxy struct {
 	cfg       *Config
 	notAuthIp sync.Map
 	transport http.RoundTripper
+	socks     *socksServer
 }
 
 var hopByHopHeaders = []string{
@@ -26,9 +27,13 @@ var hopByHopHeaders = []string{
 }
 
 func NewProxy(cfg *Config) *Proxy {
-	return &Proxy{
+	p := &Proxy{
 		cfg: cfg,
 	}
+	if cfg.socksPort > 0 {
+		p.socks = newSocksServer(cfg)
+	}
+	return p
 }
 
 func (p *Proxy) handler() http.Handler {
@@ -56,6 +61,13 @@ func (p *Proxy) Run(ctx context.Context) error {
 		}
 	} else {
 		slog.Warn("TLS disabled: set PROXY_HTTPS_PORT, PROXY_TLS_CERT_FILE and PROXY_TLS_KEY_FILE to enable it")
+	}
+
+	socksEnabled := p.socks != nil
+	if socksEnabled {
+		slog.Info("SOCKS5 enabled", "port", p.cfg.socksPort)
+	} else {
+		slog.Warn("SOCKS5 disabled: set PROXY_SOCKS_PORT to enable it")
 	}
 
 	// runCtx отменяется либо когда отменяется родительский ctx (сигнал остановки),
@@ -98,6 +110,16 @@ func (p *Proxy) Run(ctx context.Context) error {
 			slog.Info("HTTPS listener started", "addr", httpsServer.Addr)
 			if err := httpsServer.ListenAndServeTLS(p.cfg.tlsCertFile, p.cfg.tlsKeyFile); err != nil && err != http.ErrServerClosed {
 				recordErr(fmt.Errorf("https server: %w", err))
+			}
+		}()
+	}
+
+	if socksEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := p.socks.Run(); err != nil {
+				recordErr(fmt.Errorf("socks5 server: %w", err))
 			}
 		}()
 	}

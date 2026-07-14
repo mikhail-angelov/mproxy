@@ -7,6 +7,7 @@ PROXY_USER := $(shell grep '^PROXY_USER=' .env 2>/dev/null | cut -d '=' -f 2)
 PROXY_PASSWORD := $(shell grep '^PROXY_PASSWORD=' .env 2>/dev/null | cut -d '=' -f 2)
 PROXY_PORT := $(shell grep '^PROXY_PORT=' .env 2>/dev/null | cut -d '=' -f 2)
 PROXY_HTTPS_PORT := $(shell grep '^PROXY_HTTPS_PORT=' .env 2>/dev/null | cut -d '=' -f 2)
+PROXY_SOCKS_PORT := $(shell grep '^PROXY_SOCKS_PORT=' .env 2>/dev/null | cut -d '=' -f 2)
 
 # Default target
 .DEFAULT_GOAL := help
@@ -88,6 +89,13 @@ test-http: ## Test deployed HTTP proxy with curl
 	@echo "Testing HTTP proxy at $(HOST):$(PROXY_PORT)..."
 	@curl -x http://$(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_PORT) \
 		-s -o /dev/null -w "%{http_code} %{ssl_verify_result} %{time_total}s\n" \
+		https://ifconfig.me || echo "FAILED"
+
+.PHONY: test-socks5
+test-socks5: ## Test deployed SOCKS5 proxy with curl
+	@echo "Testing SOCKS5 proxy at $(HOST):$(PROXY_SOCKS_PORT)..."
+	@curl --socks5-hostname $(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_SOCKS_PORT) \
+		-s -o /dev/null -w "%{http_code} %{time_total}s\n" \
 		https://ifconfig.me || echo "FAILED"
 
 .PHONY: test-https
