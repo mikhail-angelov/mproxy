@@ -8,5 +8,14 @@ services:
       - .env
     volumes:
       - ./certs:/certs:ro
+      - ./blocked_ips.json:/app/blocked_ips.json:rw
     restart: unless-stopped
+    labels:
+      monic.enabled: "true"
+      monic.name: "mproxy"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
     stop_grace_period: 15s

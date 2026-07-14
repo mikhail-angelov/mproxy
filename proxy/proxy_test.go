@@ -8,6 +8,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +22,7 @@ func testConfig() *Config {
 		user:                "test",
 		password:            "test",
 		invalidAuthAttempts: 2,
+		blockedIpFile:       "",
 	}
 }
 
@@ -57,6 +59,58 @@ func TestCheckAuth_Table(t *testing.T) {
 			assert.Equal(t, tt.wantOK, result)
 		})
 	}
+}
+
+func TestBlockedIpPersistence(t *testing.T) {
+	f, err := os.CreateTemp("", "blocked_ips_*.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tmpFile := f.Name()
+	f.Close()
+	defer os.Remove(tmpFile)
+
+	// Write pre-existing blocked IPs
+	if err := os.WriteFile(tmpFile, []byte(`["10.0.0.1","10.0.0.2"]`), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := &Config{
+		port:                0,
+		user:                "test",
+		password:            "test",
+		invalidAuthAttempts: 2,
+		blockedIpFile:       tmpFile,
+	}
+
+	if err := cfg.loadBlockedIps(); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify pre-loaded IPs are blocked
+	_, loaded := cfg.blockedIp.Load("10.0.0.1")
+	assert.True(t, loaded)
+	_, loaded = cfg.blockedIp.Load("10.0.0.2")
+	assert.True(t, loaded)
+
+	// Block a new IP and verify it persists
+	cfg.AddBlockIp("10.0.0.3")
+	_, loaded = cfg.blockedIp.Load("10.0.0.3")
+	assert.True(t, loaded)
+
+	// Re-read file to ensure it was saved
+	cfg2 := &Config{
+		blockedIpFile: tmpFile,
+	}
+	if err := cfg2.loadBlockedIps(); err != nil {
+		t.Fatal(err)
+	}
+	_, loaded = cfg2.blockedIp.Load("10.0.0.1")
+	assert.True(t, loaded)
+	_, loaded = cfg2.blockedIp.Load("10.0.0.2")
+	assert.True(t, loaded)
+	_, loaded = cfg2.blockedIp.Load("10.0.0.3")
+	assert.True(t, loaded)
 }
 
 func TestCheckAuth_BlockAfterThreshold(t *testing.T) {
