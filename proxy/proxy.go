@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/txthinking/socks5"
 )
 
 type Proxy struct {
@@ -137,11 +140,54 @@ func (p *Proxy) Run(ctx context.Context) error {
 			recordErr(fmt.Errorf("https shutdown: %w", err))
 		}
 	}
+	if socksEnabled {
+		if err := p.socks.Shutdown(); err != nil {
+			recordErr(fmt.Errorf("socks5 shutdown: %w", err))
+		}
+	}
 
 	wg.Wait()
 
 	return firstErr
 }
+
+type socksServer struct {
+	server   *socks5.Server
+	initErr  error
+	stopping atomic.Bool
+}
+
+func newSocksServer(cfg *Config) *socksServer {
+	server, err := socks5.NewClassicServer(
+		fmt.Sprintf("0.0.0.0:%d", cfg.socksPort),
+		"0.0.0.0",
+		cfg.user,
+		cfg.password,
+		30,
+		0,
+	)
+	return &socksServer{server: server, initErr: err}
+}
+
+func (s *socksServer) Run() error {
+	if s.initErr != nil {
+		return fmt.Errorf("create socks5 server: %w", s.initErr)
+	}
+	err := s.server.ListenAndServe(nil)
+	if s.stopping.Load() && errors.Is(err, net.ErrClosed) {
+		return nil
+	}
+	return err
+}
+
+func (s *socksServer) Shutdown() error {
+	if s.server == nil {
+		return nil
+	}
+	s.stopping.Store(true)
+	return s.server.Shutdown()
+}
+
 func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {

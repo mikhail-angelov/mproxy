@@ -32,6 +32,49 @@ func authHeader(user string, pass string) string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(user+":"+pass))
 }
 
+func startSocksServer(t *testing.T, cfg *Config) string {
+	t.Helper()
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.socksPort = listener.Addr().(*net.TCPAddr).Port
+	listener.Close()
+
+	s := newSocksServer(cfg)
+	done := make(chan error, 1)
+	go func() { done <- s.Run() }()
+
+	addr := fmt.Sprintf("127.0.0.1:%d", cfg.socksPort)
+	deadline := time.Now().Add(time.Second)
+	for {
+		conn, err := net.DialTimeout("tcp", addr, 20*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("SOCKS5 server did not start: %v", err)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	t.Cleanup(func() {
+		_ = s.Shutdown()
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Errorf("SOCKS5 server stopped with error: %v", err)
+			}
+		case <-time.After(time.Second):
+			t.Error("SOCKS5 server did not stop")
+		}
+	})
+
+	return addr
+}
+
 func TestCheckAuth_Table(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -70,9 +113,7 @@ func TestSocks5AuthAndConnect(t *testing.T) {
 		password:            "testpass",
 		invalidAuthAttempts: 10,
 		blockedIpFile:       "",
-		socksPort:           0,
 	}
-	s := newSocksServer(cfg)
 
 	// Start a local TCP echo server as the "target"
 	echoLn, err := net.Listen("tcp", "127.0.0.1:0")
@@ -90,23 +131,8 @@ func TestSocks5AuthAndConnect(t *testing.T) {
 		_, _ = io.Copy(conn, conn)
 	}()
 
-	// Start a local SOCKS5 listener
-	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer socksLn.Close()
-
-	go func() {
-		conn, err := socksLn.Accept()
-		if err != nil {
-			return
-		}
-		s.handleConn(conn)
-	}()
-
 	// Connect to SOCKS5 server
-	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	conn, err := net.Dial("tcp", startSocksServer(t, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -207,25 +233,9 @@ func TestSocks5AuthFailure(t *testing.T) {
 		password:            "testpass",
 		invalidAuthAttempts: 10,
 		blockedIpFile:       "",
-		socksPort:           0,
 	}
-	s := newSocksServer(cfg)
 
-	socksLn, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer socksLn.Close()
-
-	go func() {
-		conn, err := socksLn.Accept()
-		if err != nil {
-			return
-		}
-		s.handleConn(conn)
-	}()
-
-	conn, err := net.Dial("tcp", socksLn.Addr().String())
+	conn, err := net.Dial("tcp", startSocksServer(t, cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
