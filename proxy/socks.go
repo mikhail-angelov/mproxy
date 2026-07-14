@@ -99,6 +99,7 @@ func (s *socksServer) handleConn(conn net.Conn) {
 		return
 	}
 	defer target.Close()
+	slog.Info("socks5 target connected", "target", targetAddr)
 
 	// 4. A CONNECT response may use an unspecified bind address. Returning one
 	// avoids relying on the target socket's local address, which is not useful
@@ -107,6 +108,7 @@ func (s *socksServer) handleConn(conn net.Conn) {
 		slog.Warn("socks5 reply failed", "ip", clientIP, "target", targetAddr, "error", err)
 		return
 	}
+	slog.Info("socks5 tunnel established", "ip", clientIP, "target", targetAddr)
 	_ = conn.SetDeadline(time.Time{})
 
 	// 5. Bidirectional copy

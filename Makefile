@@ -94,7 +94,8 @@ test-http: ## Test deployed HTTP proxy with curl
 .PHONY: test-socks5
 test-socks5: ## Test deployed SOCKS5 proxy with curl
 	@echo "Testing SOCKS5 proxy at $(HOST):$(PROXY_SOCKS_PORT)..."
-	@curl --socks5-hostname $(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_SOCKS_PORT) \
+	@ALL_PROXY='' curl --fail --show-error --connect-timeout 10 --max-time 30 \
+		--socks5-hostname $(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_SOCKS_PORT) \
 		-s -o /dev/null -w "%{http_code} %{time_total}s\n" \
 		https://ifconfig.me || echo "FAILED"
 
