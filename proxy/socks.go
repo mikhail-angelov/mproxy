@@ -83,12 +83,16 @@ func (s *socksServer) handleConn(conn net.Conn) {
 		return
 	}
 
-	_ = conn.SetDeadline(time.Time{})
 	slog.Info("socks5 connect", "ip", clientIP, "host", host, "port", port)
+
+	// Keep the client deadline through tunnel setup. Previously it was cleared
+	// before dialing, so a stalled target connection or SOCKS reply could leave
+	// the client waiting indefinitely without a useful proxy error.
+	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
 
 	// 3. Connect to target
 	targetAddr := net.JoinHostPort(host, fmt.Sprintf("%d", port))
-	target, err := net.DialTimeout("tcp", targetAddr, 10*time.Second)
+	target, err := (&net.Dialer{Timeout: 10 * time.Second}).Dial("tcp", targetAddr)
 	if err != nil {
 		slog.Warn("socks5 dial failed", "target", targetAddr, "error", err)
 		s.reply(conn, socksRepHostUnreach, nil)
@@ -99,8 +103,10 @@ func (s *socksServer) handleConn(conn net.Conn) {
 	// 4. Send success response with local binding address
 	localAddr := target.LocalAddr().(*net.TCPAddr)
 	if err := s.reply(conn, socksRepSuccess, localAddr); err != nil {
+		slog.Warn("socks5 reply failed", "ip", clientIP, "target", targetAddr, "error", err)
 		return
 	}
+	_ = conn.SetDeadline(time.Time{})
 
 	// 5. Bidirectional copy
 	errChan := make(chan error, 2)
