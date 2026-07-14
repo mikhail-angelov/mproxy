@@ -205,7 +205,7 @@ func TestHandleProxy_ConnectTunnel(t *testing.T) {
 	}()
 
 	p := NewProxy(testConfig())
-	proxyServer := httptest.NewServer(http.HandlerFunc(p.handleProxy))
+	proxyServer := httptest.NewServer(p.handler())
 	defer proxyServer.Close()
 
 	proxyAddr := strings.TrimPrefix(proxyServer.URL, "http://")
@@ -263,7 +263,7 @@ func TestHandleProxy_ConnectTunnel(t *testing.T) {
 
 func TestHandleProxy_ConnectTunnel_Unauthorized(t *testing.T) {
 	p := NewProxy(testConfig())
-	proxyServer := httptest.NewServer(http.HandlerFunc(p.handleProxy))
+	proxyServer := httptest.NewServer(p.handler())
 	defer proxyServer.Close()
 
 	proxyAddr := strings.TrimPrefix(proxyServer.URL, "http://")

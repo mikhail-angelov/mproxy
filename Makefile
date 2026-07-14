@@ -3,6 +3,10 @@
 # Variables
 APP_NAME := mproxy
 HOST := $(shell grep '^HOST=' .env 2>/dev/null | cut -d '=' -f 2)
+PROXY_USER := $(shell grep '^PROXY_USER=' .env 2>/dev/null | cut -d '=' -f 2)
+PROXY_PASSWORD := $(shell grep '^PROXY_PASSWORD=' .env 2>/dev/null | cut -d '=' -f 2)
+PROXY_PORT := $(shell grep '^PROXY_PORT=' .env 2>/dev/null | cut -d '=' -f 2)
+PROXY_HTTPS_PORT := $(shell grep '^PROXY_HTTPS_PORT=' .env 2>/dev/null | cut -d '=' -f 2)
 
 # Default target
 .DEFAULT_GOAL := help
@@ -43,7 +47,8 @@ certs: ## Generate self-signed TLS certificates
 	@mkdir -p certs
 	@openssl req -x509 -newkey rsa:2048 -nodes \
 		-keyout certs/privkey.pem -out certs/fullchain.pem \
-		-days 365 -subj "/CN=localhost"
+		-days 365 -subj "/CN=localhost" && \
+	chmod +r certs/privkey.pem
 	@echo "Certificates generated: certs/"
 
 .PHONY: clean
@@ -78,11 +83,48 @@ all: test build ## Run tests and build
 ci: test build ## CI pipeline simulation
 	@echo "CI pipeline completed successfully"
 
-# Install — copy configs to remote host
+.PHONY: test-http
+test-http: ## Test deployed HTTP proxy with curl
+	@echo "Testing HTTP proxy at $(HOST):$(PROXY_PORT)..."
+	@curl -x http://$(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_PORT) \
+		-s -o /dev/null -w "%{http_code} %{ssl_verify_result} %{time_total}s\n" \
+		https://ifconfig.me || echo "FAILED"
+
+.PHONY: test-https
+test-https: ## Test deployed HTTPS proxy with curl (skip proxy cert verification)
+	@echo "Testing HTTPS proxy at $(HOST):$(PROXY_HTTPS_PORT)..."
+	@curl -x https://$(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_HTTPS_PORT) \
+		--proxy-insecure -s -o /dev/null \
+		-w "%{http_code} %{time_total}s\n" \
+		https://ifconfig.me
+	@echo ""
+	@echo "To verify the certificate properly, download the remote cert and use --proxy-cacert:"
+	@echo ""
+	@echo "  openssl s_client -connect $(HOST):$(PROXY_HTTPS_PORT) -showcerts </dev/null 2>/dev/null \\"
+	@echo "    | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' \\"
+	@echo "    > remote-fullchain.pem"
+	@echo ""
+	@echo "  curl -x https://$(PROXY_USER):$(PROXY_PASSWORD)@$(HOST):$(PROXY_HTTPS_PORT) \\"
+	@echo "    --proxy-cacert remote-fullchain.pem \\"
+	@echo "    -s -o /dev/null -w '%{http_code} %{time_total}s\\n' \\"
+	@echo "    https://ifconfig.me"
+
+# Install — copy configs and generate certificates on remote host
 .PHONY: install
-install: ## Copy .env and docker-compose.yml to remote host
+install: ## Copy configs to remote host and generate TLS certificates if missing
 	@echo "Installing $(APP_NAME) on $(HOST)..."
-	-ssh root@$(HOST) "mkdir -p /opt/$(APP_NAME)"
+	-ssh root@$(HOST) "mkdir -p /opt/$(APP_NAME)/certs"
+	@echo "Generating TLS certificates on $(HOST) if not present..."
+	-ssh root@$(HOST) "if [ ! -f /opt/$(APP_NAME)/certs/privkey.pem ]; then \
+		openssl req -x509 -newkey rsa:2048 -nodes \
+			-keyout /opt/$(APP_NAME)/certs/privkey.pem \
+			-out /opt/$(APP_NAME)/certs/fullchain.pem \
+			-days 365 -subj '/CN=localhost' && \
+		chmod +r /opt/$(APP_NAME)/certs/privkey.pem && \
+		echo 'Certificates generated successfully'; \
+	else \
+		echo 'Certificates already exist, skipping'; \
+	fi"
 	-ssh root@$(HOST) "touch /opt/$(APP_NAME)/blocked_ips.json"
 	scp ./.env root@$(HOST):/opt/$(APP_NAME)/.env
 	scp ./docker-compose.yml root@$(HOST):/opt/$(APP_NAME)/docker-compose.yml

@@ -31,14 +31,17 @@ func NewProxy(cfg *Config) *Proxy {
 	}
 }
 
+func (p *Proxy) handler() http.Handler {
+	// CONNECT uses an authority-form request target (host:port), which does not
+	// match ServeMux's slash-prefixed path patterns. Use the proxy handler
+	// directly so both regular requests and CONNECT tunnels reach it.
+	return http.HandlerFunc(p.handleProxy)
+}
+
 func (p *Proxy) Run(ctx context.Context) error {
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("/", p.handleProxy)
-
 	httpServer := &http.Server{
 		Addr:              fmt.Sprintf("0.0.0.0:%d", p.cfg.port),
-		Handler:           mux,
+		Handler:           p.handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -48,7 +51,7 @@ func (p *Proxy) Run(ctx context.Context) error {
 	if tlsEnabled {
 		httpsServer = &http.Server{
 			Addr:              fmt.Sprintf("0.0.0.0:%d", p.cfg.httpsPort),
-			Handler:           mux,
+			Handler:           p.handler(),
 			ReadHeaderTimeout: 10 * time.Second,
 		}
 	} else {
@@ -237,6 +240,13 @@ func (p *Proxy) handleHTTPForwarding(w http.ResponseWriter, r *http.Request) {
 	for _, h := range hopByHopHeaders {
 		reqCopy.Header.Del(h)
 	}
+
+	slog.Debug("forwarding request",
+		"host", reqCopy.Host,
+		"url", reqCopy.URL.String(),
+		"has_proxy_auth", reqCopy.Header.Get("Proxy-Authorization") != "",
+		"has_proxy_connection", reqCopy.Header.Get("Proxy-Connection") != "",
+	)
 
 	transport := http.DefaultTransport
 	if p.transport != nil {
